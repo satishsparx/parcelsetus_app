@@ -12,6 +12,22 @@ Node.js + Express API for ParcelSetus, including seller authentication and the e
 
 API listens on `http://localhost:4000` by default. Configure `CLIENT_ORIGIN` for the frontend origin.
 
+## Local MongoDB Compass
+
+The local MongoDB Community 8.0 service uses `127.0.0.1:27017`. In Compass, create a connection with:
+
+```text
+mongodb://127.0.0.1:27017
+```
+
+The `parcelsetus` database, `users` collection, and `sessions` collection are created when the first account/session is written. The backend `.env` is configured to use `mongodb://127.0.0.1:27017/parcelsetus`.
+
+On this Mac, Node 22 is installed keg-only to leave the existing global Node version untouched. Start the API with:
+
+```sh
+PATH="/opt/homebrew/opt/node@22/bin:$PATH" npm run dev
+```
+
 ## Authentication routes
 
 - `POST /api/auth/register` — validates fields, normalizes and uniquely indexes email, hashes passwords with bcrypt, and sends an expiring verification link
