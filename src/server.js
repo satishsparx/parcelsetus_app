@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { carriers } from './carriers/demo.js';
 import authRouter from './auth.js';
-import { User } from './models.js';
+import { Address, User } from './models.js';
 import { SESSION_COOKIE_NAME, sessionCookieOptions } from './session.js';
 
 const app = express();
@@ -45,21 +45,34 @@ app.use(
 
 app.use('/api/auth', authRouter);
 
-// Shipment and address persistence remains a demo store; every query is scoped to the authenticated seller.
+// Shipment and quote data remain demo stores; every query is scoped to the authenticated seller.
 const shipments = new Map();
-const addresses = new Map();
 const quotes = new Map();
 const idempotency = new Map();
 const addressSchema = z.object({
-  label: z.string().min(1),
-  contactName: z.string().min(1),
-  phone: z.string().optional(),
-  address: z.string().min(5),
+  label: z.string().trim().min(1).max(80),
+  contactName: z.string().trim().min(1).max(100),
+  phone: z.string().trim().max(20).optional().default(''),
+  address: z.string().trim().min(5).max(300),
   pin: z.string().regex(/^\d{6}$/),
-  city: z.string().optional(),
-  state: z.string().optional(),
-  type: z.string().optional(),
-  default: z.boolean().optional(),
+  city: z.string().trim().max(100).optional().default(''),
+  state: z.string().trim().max(100).optional().default(''),
+  type: z.string().optional().default('Pickup'),
+  default: z.boolean().optional().default(false),
+});
+const profileSchema = z.object({
+  fullName: z.string().trim().min(2).max(100),
+  businessName: z.string().trim().max(120).optional().default(''),
+  mobile: z.string().trim().max(20).optional().default(''),
+  businessAddress: z.string().trim().max(300).optional().default(''),
+  gstin: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .max(15)
+    .regex(/^$|^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/)
+    .optional()
+    .default(''),
 });
 const quoteSchema = z.object({
   pickupPin: z.string().regex(/^\d{6}$/),
@@ -134,6 +147,30 @@ app.get('/api/providers', (_req, res) =>
   res.json(carriers.map(({ name, capabilities }) => ({ name, capabilities, mode: 'demo' }))),
 );
 app.use('/api', requireVerifiedSeller);
+app.patch('/api/profile', async (req, res, next) => {
+  try {
+    const input = validate(profileSchema, req, res);
+    if (!input) return;
+    const user = await User.findByIdAndUpdate(req.sellerId, { $set: input }, { new: true });
+    if (!user) return res.status(404).json({ error: 'Account not found.' });
+    return res.json({
+      user: {
+        id: user.id,
+        fullName: user.fullName,
+        email: user.email,
+        mobile: user.mobile,
+        businessName: user.businessName,
+        businessAddress: user.businessAddress,
+        gstin: user.gstin,
+        accountType: user.accountType,
+        emailVerified: Boolean(user.emailVerifiedAt),
+        authProviders: user.authProviders || [],
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
 app.get('/api/shipments', (_req, res) =>
   res.json(
     [...shipments.values()]
@@ -246,27 +283,66 @@ app.post('/api/shipments/:id/track', async (req, res) => {
   if (!carrier) return res.status(404).json({ error: 'Provider unavailable' });
   res.json(await carrier.getTracking(shipment.awb));
 });
-app.get('/api/addresses', (req, res) =>
-  res.json([...addresses.values()].filter(a => a.sellerId === req.sellerId)),
-);
-app.post('/api/addresses', (req, res) => {
-  const body = validate(addressSchema, req, res);
-  if (!body) return;
-  const address = {
-    ...body,
-    id: randomUUID(),
-    sellerId: req.sellerId,
-    createdAt: new Date().toISOString(),
-  };
-  addresses.set(address.id, address);
-  res.status(201).json(address);
+app.get('/api/addresses', async (req, res, next) => {
+  try {
+    res.json(await Address.find({ sellerId: req.sellerId }).sort({ createdAt: -1 }).lean());
+  } catch (error) {
+    next(error);
+  }
 });
-app.delete('/api/addresses/:id', (req, res) => {
-  const address = addresses.get(req.params.id);
-  if (!address || address.sellerId !== req.sellerId)
-    return res.status(404).json({ error: 'Address not found' });
-  addresses.delete(address.id);
-  res.status(204).end();
+app.post('/api/addresses', async (req, res, next) => {
+  try {
+    const body = validate(addressSchema, req, res);
+    if (!body) return;
+    if (body.default)
+      await Address.updateMany({ sellerId: req.sellerId }, { $set: { default: false } });
+    const count = await Address.countDocuments({ sellerId: req.sellerId });
+    const address = await Address.create({
+      ...body,
+      id: randomUUID(),
+      sellerId: req.sellerId,
+      default: body.default || count === 0,
+    });
+    return res.status(201).json(address);
+  } catch (error) {
+    next(error);
+  }
+});
+app.put('/api/addresses/:id', async (req, res, next) => {
+  try {
+    const body = validate(addressSchema, req, res);
+    if (!body) return;
+    if (body.default)
+      await Address.updateMany(
+        { sellerId: req.sellerId, id: { $ne: req.params.id } },
+        { $set: { default: false } },
+      );
+    const address = await Address.findOneAndUpdate(
+      { id: req.params.id, sellerId: req.sellerId },
+      { $set: body },
+      { new: true, runValidators: true },
+    );
+    if (!address) return res.status(404).json({ error: 'Address not found.' });
+    return res.json(address);
+  } catch (error) {
+    next(error);
+  }
+});
+app.delete('/api/addresses/:id', async (req, res, next) => {
+  try {
+    const address = await Address.findOneAndDelete({ id: req.params.id, sellerId: req.sellerId });
+    if (!address) return res.status(404).json({ error: 'Address not found.' });
+    if (address.default) {
+      const nextDefault = await Address.findOne({ sellerId: req.sellerId }).sort({ createdAt: 1 });
+      if (nextDefault) {
+        nextDefault.default = true;
+        await nextDefault.save();
+      }
+    }
+    return res.status(204).end();
+  } catch (error) {
+    next(error);
+  }
 });
 app.use((err, _req, res, _next) => {
   console.error(err);

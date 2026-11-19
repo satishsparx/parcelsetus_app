@@ -6,6 +6,11 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
     mobile: { type: String, trim: true, default: '' },
     businessName: { type: String, trim: true, default: '' },
+    businessAddress: { type: String, trim: true, default: '', maxlength: 300 },
+    gstin: { type: String, trim: true, uppercase: true, default: '', maxlength: 15 },
+    pendingEmail: { type: String, lowercase: true, trim: true, select: false },
+    emailChangeTokenHash: { type: String, select: false },
+    emailChangeExpiresAt: { type: Date, select: false },
     accountType: { type: String, enum: ['Individual', 'Business'], required: true },
     passwordHash: { type: String, select: false },
     googleSubject: { type: String, unique: true, sparse: true, select: false },
@@ -22,6 +27,25 @@ const userSchema = new mongoose.Schema(
 );
 
 export const User = mongoose.model('User', userSchema);
+
+const addressSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    sellerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    label: { type: String, required: true, trim: true, maxlength: 80 },
+    contactName: { type: String, required: true, trim: true, maxlength: 100 },
+    phone: { type: String, trim: true, default: '', maxlength: 20 },
+    address: { type: String, required: true, trim: true, maxlength: 300 },
+    pin: { type: String, required: true, match: /^\d{6}$/ },
+    city: { type: String, trim: true, default: '', maxlength: 100 },
+    state: { type: String, trim: true, default: '', maxlength: 100 },
+    type: { type: String, default: 'Pickup' },
+    default: { type: Boolean, default: false },
+  },
+  { timestamps: true },
+);
+
+export const Address = mongoose.model('Address', addressSchema);
 
 const sessionHistorySchema = new mongoose.Schema(
   {

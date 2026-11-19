@@ -24,6 +24,8 @@ const publicUser = user => ({
   email: user.email,
   mobile: user.mobile,
   businessName: user.businessName,
+  businessAddress: user.businessAddress || '',
+  gstin: user.gstin || '',
   accountType: user.accountType,
   emailVerified: Boolean(user.emailVerifiedAt),
   authProviders: user.authProviders || [],
@@ -214,6 +216,68 @@ router.post('/resend-verification', async (req, res, next) => {
       message: 'If this address has an unverified account, a new link has been sent.',
       ...(developmentLink ? { developmentLink } : {}),
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/change-email', async (req, res, next) => {
+  try {
+    if (!req.session?.userId) return res.status(401).json({ error: 'Sign in to continue.' });
+    const parsed = emailSchema.safeParse(req.body?.email);
+    if (!parsed.success) return res.status(400).json({ error: 'Enter a valid email address.' });
+    const user = await User.findById(req.session.userId).select('+sessionVersion');
+    if (
+      !user ||
+      user.status !== 'active' ||
+      !user.emailVerifiedAt ||
+      user.sessionVersion !== req.session.sessionVersion
+    )
+      return res.status(401).json({ error: 'Sign in again to continue.' });
+    if (parsed.data === user.email)
+      return res.json({ message: 'This is already your account email address.' });
+    if (await User.exists({ email: parsed.data }))
+      return res.status(409).json({ error: 'An account already uses this email address.' });
+    if (await User.exists({ pendingEmail: parsed.data, _id: { $ne: user.id } }))
+      return res.status(409).json({ error: 'This email address is awaiting verification.' });
+    const rawToken = token();
+    user.pendingEmail = parsed.data;
+    user.emailChangeTokenHash = hashToken(rawToken);
+    user.emailChangeExpiresAt = new Date(Date.now() + 30 * 60_000);
+    await user.save();
+    const result = await sendLink({
+      to: parsed.data,
+      subject: 'Confirm your new ParcelSetus email',
+      title: 'Confirm your new email address',
+      link: `${process.env.APP_ORIGIN || 'http://localhost:5173'}/?changeEmail=${encodeURIComponent(rawToken)}`,
+    });
+    return res.json({
+      message: `Check ${parsed.data} to confirm your new email address.`,
+      ...(result.developmentLink ? { developmentLink: result.developmentLink } : {}),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/verify-email-change', async (req, res, next) => {
+  try {
+    const parsed = z.string().min(20).safeParse(req.body?.token);
+    if (!parsed.success) return res.status(400).json({ error: 'This email link is invalid.' });
+    const user = await User.findOne({
+      emailChangeTokenHash: hashToken(parsed.data),
+      emailChangeExpiresAt: { $gt: new Date() },
+    }).select('+emailChangeTokenHash +emailChangeExpiresAt +pendingEmail');
+    if (!user?.pendingEmail)
+      return res.status(400).json({ error: 'This email link is invalid or has expired.' });
+    if (await User.exists({ email: user.pendingEmail, _id: { $ne: user.id } }))
+      return res.status(409).json({ error: 'An account already uses this email address.' });
+    user.email = user.pendingEmail;
+    user.pendingEmail = undefined;
+    user.emailChangeTokenHash = undefined;
+    user.emailChangeExpiresAt = undefined;
+    await user.save();
+    return res.json({ message: 'Your email address has been updated.' });
   } catch (error) {
     next(error);
   }
