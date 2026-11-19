@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { carriers } from './carriers/demo.js';
 import authRouter from './auth.js';
 import { User } from './models.js';
+import { SESSION_COOKIE_NAME, sessionCookieOptions } from './session.js';
 
 const app = express();
 const port = Number(process.env.PORT || 4000);
@@ -25,7 +26,7 @@ app.use(
 );
 app.use(
   session({
-    name: 'parcelsetus.sid',
+    name: SESSION_COOKIE_NAME,
     secret:
       process.env.SESSION_SECRET ||
       (process.env.NODE_ENV === 'production'
@@ -38,13 +39,7 @@ app.use(
       collectionName: 'sessions',
       ttl: 14 * 24 * 60 * 60,
     }),
-    cookie: {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 14 * 24 * 60 * 60 * 1000,
-      path: '/',
-    },
+    cookie: sessionCookieOptions(),
   }),
 );
 
