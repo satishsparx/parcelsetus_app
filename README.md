@@ -12,6 +12,10 @@ Node.js + Express API for ParcelSetus, including seller authentication and the e
 
 API listens on `http://localhost:4000` by default. Configure `CLIENT_ORIGIN` for the frontend origin.
 
+## Code quality
+
+Run `npm run lint` for backend ESLint checks, `npm run format` to apply Prettier, or `npm run format:check` to check style without editing files. Use Node 20 or newer for these commands.
+
 ## Local MongoDB Compass
 
 The local MongoDB Community 8.0 service uses `127.0.0.1:27017`. In Compass, create a connection with:
