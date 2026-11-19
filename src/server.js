@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { carriers } from './carriers/demo.js';
 import authRouter from './auth.js';
-import { Address, User } from './models.js';
+import { Address, Shipment, User } from './models.js';
 import { SESSION_COOKIE_NAME, sessionCookieOptions } from './session.js';
 
 const app = express();
@@ -45,10 +45,8 @@ app.use(
 
 app.use('/api/auth', authRouter);
 
-// Shipment and quote data remain demo stores; every query is scoped to the authenticated seller.
-const shipments = new Map();
+// Quote data remains a short-lived demo store; shipments and addresses persist in MongoDB.
 const quotes = new Map();
-const idempotency = new Map();
 const addressSchema = z.object({
   label: z.string().trim().min(1).max(80),
   contactName: z.string().trim().min(1).max(100),
@@ -171,77 +169,95 @@ app.patch('/api/profile', async (req, res, next) => {
     next(error);
   }
 });
-app.get('/api/shipments', (_req, res) =>
-  res.json(
-    [...shipments.values()]
-      .filter(s => s.sellerId === _req.sellerId)
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-  ),
-);
-app.get('/api/shipments/:id', (req, res) => {
-  const item = shipments.get(req.params.id);
-  if (!item || item.sellerId !== req.sellerId)
-    return res.status(404).json({ error: 'Shipment not found' });
-  res.json(item);
-});
-app.post('/api/shipments', async (req, res) => {
-  const key = req.get('Idempotency-Key');
-  if (key && idempotency.has(key)) return res.status(200).json(idempotency.get(key));
-  const data = bookingSchema.safeParse(req.body);
-  // Allow the web demo's concise record payload while retaining strict booking validation.
-  if (!data.success) {
-    const demo = z
-      .object({
-        id: z.string(),
-        awb: z.string(),
-        provider: z.string(),
-        recipient: z.string(),
-        destination: z.string().regex(/^\d{6}$/),
-        date: z.string(),
-        amount: z.number().nonnegative(),
-        status: z.string(),
-      })
-      .safeParse(req.body);
-    if (!demo.success)
-      return res
-        .status(400)
-        .json({ error: 'Invalid booking details', details: data.error.flatten() });
-    const record = {
-      ...demo.data,
-      sellerId: req.sellerId,
-      createdAt: new Date().toISOString(),
-      events: [],
-    };
-    shipments.set(record.id, record);
-    if (key) idempotency.set(key, record);
-    return res.status(201).json(record);
+app.get('/api/shipments', async (req, res, next) => {
+  try {
+    const items = await Shipment.find({ sellerId: req.sellerId }).sort({ createdAt: -1 }).lean();
+    return res.json(items);
+  } catch (error) {
+    next(error);
   }
-  const booking = data.data;
-  const quote = quotes.get(booking.quoteId);
-  const carrier = carrierByName(booking.provider);
-  if (!carrier) return res.status(400).json({ error: 'Provider is not available' });
-  if (!quote || quote.expiresAt < new Date().toISOString() || quote.carrier !== carrier.name)
-    return res.status(409).json({ error: 'Rate quote expired or invalid. Request a fresh quote.' });
-  const result = await carrier.createBooking(booking);
-  const id = `SHP-${new Date().getFullYear()}-${String(shipments.size + 1).padStart(6, '0')}`;
-  const record = {
-    id,
-    awb: result.awb,
-    provider: carrier.name,
-    recipient: booking.delivery.contactName,
-    destination: booking.delivery.pin,
-    date: new Date().toLocaleDateString('en-IN'),
-    amount: quote.amount,
-    status: result.status,
-    sellerId: req.sellerId,
-    createdAt: new Date().toISOString(),
-    labelUrl: result.labelUrl,
-    demo: true,
-    events: [],
-  };
-  shipments.set(id, record);
-  if (key) idempotency.set(key, record);
-  res.status(201).json(record);
+});
+app.get('/api/shipments/:id', async (req, res, next) => {
+  try {
+    const item = await Shipment.findOne({ id: req.params.id, sellerId: req.sellerId }).lean();
+    if (!item) return res.status(404).json({ error: 'Shipment not found' });
+    return res.json(item);
+  } catch (error) {
+    next(error);
+  }
+});
+app.post('/api/shipments', async (req, res, next) => {
+  try {
+    const key = req.get('Idempotency-Key');
+    if (key) {
+      const existing = await Shipment.findOne({ sellerId: req.sellerId, idempotencyKey: key });
+      if (existing) return res.status(200).json(existing);
+    }
+    const data = bookingSchema.safeParse(req.body);
+    // Allow the web demo's concise record payload while retaining strict booking validation.
+    if (!data.success) {
+      const demo = z
+        .object({
+          id: z.string(),
+          awb: z.string(),
+          provider: z.string(),
+          recipient: z.string(),
+          destination: z.string().regex(/^\d{6}$/),
+          date: z.string(),
+          amount: z.number().nonnegative(),
+          status: z.string(),
+        })
+        .safeParse(req.body);
+      if (!demo.success)
+        return res
+          .status(400)
+          .json({ error: 'Invalid booking details', details: data.error.flatten() });
+      const record = await Shipment.create({
+        ...demo.data,
+        sellerId: req.sellerId,
+        idempotencyKey: key,
+        details: req.body,
+        events: [],
+      });
+      return res.status(201).json(record);
+    }
+    const booking = data.data;
+    const quote = quotes.get(booking.quoteId);
+    const carrier = carrierByName(booking.provider);
+    if (!carrier) return res.status(400).json({ error: 'Provider is not available' });
+    if (!quote || quote.expiresAt < new Date().toISOString() || quote.carrier !== carrier.name)
+      return res
+        .status(409)
+        .json({ error: 'Rate quote expired or invalid. Request a fresh quote.' });
+    const result = await carrier.createBooking(booking);
+    const id = `SHP-${new Date().getFullYear()}-${randomUUID().slice(0, 8).toUpperCase()}`;
+    const record = await Shipment.create({
+      id,
+      awb: result.awb,
+      provider: carrier.name,
+      recipient: booking.delivery.contactName,
+      destination: booking.delivery.pin,
+      date: new Date().toLocaleDateString('en-IN'),
+      amount: quote.amount,
+      status: result.status,
+      sellerId: req.sellerId,
+      idempotencyKey: key,
+      labelUrl: result.labelUrl,
+      demo: true,
+      events: [],
+      details: booking,
+    });
+    return res.status(201).json(record);
+  } catch (error) {
+    if (error.code === 11000) {
+      const key = req.get('Idempotency-Key');
+      if (key) {
+        const existing = await Shipment.findOne({ sellerId: req.sellerId, idempotencyKey: key });
+        if (existing) return res.status(200).json(existing);
+      }
+    }
+    return next(error);
+  }
 });
 app.post('/api/rates', async (req, res) => {
   const request = validate(quoteSchema, req, res);
@@ -275,13 +291,21 @@ app.post('/api/rates', async (req, res) => {
   );
   res.json(results);
 });
-app.post('/api/shipments/:id/track', async (req, res) => {
-  const shipment = shipments.get(req.params.id);
-  if (!shipment || shipment.sellerId !== req.sellerId)
-    return res.status(404).json({ error: 'Shipment not found' });
-  const carrier = carrierByName(shipment.provider);
-  if (!carrier) return res.status(404).json({ error: 'Provider unavailable' });
-  res.json(await carrier.getTracking(shipment.awb));
+app.post('/api/shipments/:id/track', async (req, res, next) => {
+  try {
+    const shipment = await Shipment.findOne({ id: req.params.id, sellerId: req.sellerId });
+    if (!shipment) return res.status(404).json({ error: 'Shipment not found' });
+    const carrier = carrierByName(shipment.provider);
+    if (!carrier) return res.status(404).json({ error: 'Provider unavailable' });
+    const tracking = await carrier.getTracking(shipment.awb);
+    shipment.status = tracking.status || shipment.status;
+    shipment.events = tracking.events || shipment.events;
+    shipment.lastTrackedAt = new Date();
+    await shipment.save();
+    return res.json(tracking);
+  } catch (error) {
+    next(error);
+  }
 });
 app.get('/api/addresses', async (req, res, next) => {
   try {
