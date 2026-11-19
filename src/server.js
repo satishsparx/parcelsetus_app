@@ -7,10 +7,10 @@ import session from 'express-session';
 import MongoStore from 'connect-mongo';
 import mongoose from 'mongoose';
 import { z } from 'zod';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { carriers } from './carriers/demo.js';
 import authRouter from './auth.js';
-import { Address, Shipment, User } from './models.js';
+import { Address, Payment, Shipment, User } from './models.js';
 import { SESSION_COOKIE_NAME, sessionCookieOptions } from './session.js';
 
 const app = express();
@@ -19,6 +19,11 @@ app.disable('x-powered-by');
 app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false);
 app.use(helmet());
 app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173', credentials: true }));
+app.post(
+  '/api/webhooks/razorpay',
+  express.raw({ type: 'application/json' }),
+  handleRazorpayWebhook,
+);
 app.use(express.json({ limit: '1mb' }));
 app.use(
   '/api/auth',
@@ -81,34 +86,147 @@ const quoteSchema = z.object({
   heightCm: z.coerce.number().nonnegative().optional().default(0),
   paymentType: z.enum(['Prepaid', 'COD']).default('Prepaid'),
 });
-const bookingSchema = z.object({
-  quoteId: z.string(),
-  provider: z.string(),
-  pickup: z.object({
-    contactName: z.string().min(1),
-    phone: z.string().min(8),
-    address: z.string().min(5),
-    pin: z.string().regex(/^\d{6}$/),
-  }),
-  delivery: z.object({
-    contactName: z.string().min(1),
-    phone: z.string().min(8),
-    address: z.string().min(5),
-    pin: z.string().regex(/^\d{6}$/),
-  }),
-  parcel: z.object({
-    weightGrams: z.coerce.number().positive(),
-    lengthCm: z.coerce.number().positive(),
-    widthCm: z.coerce.number().positive(),
-    heightCm: z.coerce.number().positive(),
-    description: z.string().optional(),
-    value: z.coerce.number().nonnegative().optional(),
+const paymentOrderSchema = z.object({
+  quoteId: z.string().min(1),
+  provider: z.string().min(1).max(80),
+  idempotencyKey: z.string().min(8).max(80),
+  shipment: z.object({
+    recipient: z.string().trim().min(1).max(100),
+    phone: z.string().trim().min(8).max(20),
+    address: z.string().trim().min(5).max(300),
+    destination: z.string().regex(/^\d{6}$/),
+    city: z.string().trim().max(100).optional().default(''),
+    state: z.string().trim().max(100).optional().default(''),
+    pickupName: z.string().trim().min(1).max(100),
+    pickupPhone: z.string().trim().min(8).max(20),
+    pickupAddress: z.string().trim().min(5).max(300),
+    pickupPin: z.string().regex(/^\d{6}$/),
+    pickupCity: z.string().trim().max(100).optional().default(''),
+    pickupState: z.string().trim().max(100).optional().default(''),
+    weight: z.coerce.number().positive(),
+    length: z.coerce.number().positive(),
+    width: z.coerce.number().positive(),
+    height: z.coerce.number().positive(),
+    description: z.string().trim().max(200).optional().default(''),
+    value: z.coerce.number().nonnegative(),
     paymentType: z.enum(['Prepaid', 'COD']),
-    codAmount: z.coerce.number().nonnegative().optional(),
+    codAmount: z.coerce.number().nonnegative().optional().default(0),
   }),
 });
 const carrierByName = name =>
   carriers.find(c => c.name.toLowerCase() === String(name).toLowerCase());
+
+const razorpayConfigured = () =>
+  Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
+
+function razorpaySignature(secret, value) {
+  return createHmac('sha256', secret).update(value).digest();
+}
+
+function signatureMatches(actual, expected) {
+  if (typeof actual !== 'string' || !/^[a-f\d]{64}$/i.test(actual)) return false;
+  return timingSafeEqual(Buffer.from(actual, 'hex'), expected);
+}
+
+async function razorpayRequest(path, method = 'GET', payload) {
+  const credentials = Buffer.from(
+    `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`,
+  ).toString('base64');
+  const response = await fetch(`https://api.razorpay.com/v1${path}`, {
+    method,
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      'Content-Type': 'application/json',
+    },
+    ...(payload ? { body: JSON.stringify(payload) } : {}),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.description || 'Payment provider request failed.');
+  return data;
+}
+
+async function finalizeCapturedPayment(payment, gatewayPayment) {
+  if (
+    gatewayPayment.status !== 'captured' ||
+    gatewayPayment.order_id !== payment.gatewayOrderId ||
+    gatewayPayment.amount !== payment.amountPaise ||
+    gatewayPayment.currency !== payment.currency
+  )
+    throw new Error('Payment details do not match the pending checkout.');
+
+  if (payment.status === 'used' && payment.shipmentId)
+    return Shipment.findById(payment.shipmentId).lean();
+
+  payment.status = 'paid';
+  payment.gatewayPaymentId = gatewayPayment.id;
+  payment.method = gatewayPayment.method;
+  payment.paidAt = new Date();
+  await payment.save();
+
+  let shipment = await Shipment.findOne({ paymentId: payment._id });
+  if (!shipment) {
+    const draft = payment.shipmentDraft;
+    const providerCode = payment.carrier.slice(0, 2).toUpperCase();
+    try {
+      shipment = await Shipment.create({
+        id: draft.idempotencyKey,
+        sellerId: payment.sellerId,
+        awb: `${providerCode}${randomUUID().replaceAll('-', '').slice(0, 10).toUpperCase()}`,
+        provider: payment.carrier,
+        recipient: draft.recipient,
+        destination: draft.destination,
+        date: new Intl.DateTimeFormat('en-IN', {
+          day: '2-digit',
+          month: 'short',
+          year: 'numeric',
+          timeZone: 'Asia/Kolkata',
+        }).format(new Date()),
+        amount: payment.amountPaise / 100,
+        status: 'Pickup scheduled',
+        paymentId: payment._id,
+        idempotencyKey: draft.idempotencyKey,
+        details: draft,
+        demo: true,
+        events: [],
+      });
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+      shipment = await Shipment.findOne({ paymentId: payment._id });
+      if (!shipment) throw error;
+    }
+  }
+
+  payment.status = 'used';
+  payment.shipmentId = shipment._id;
+  await payment.save();
+  return shipment.toObject();
+}
+
+async function handleRazorpayWebhook(req, res, next) {
+  try {
+    const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!secret) return res.status(503).json({ error: 'Payment webhook is not configured.' });
+    if (!Buffer.isBuffer(req.body)) return res.status(400).json({ error: 'Invalid webhook body.' });
+    const expected = razorpaySignature(secret, req.body);
+    if (!signatureMatches(req.get('x-razorpay-signature'), expected))
+      return res.status(401).json({ error: 'Invalid webhook signature.' });
+    const event = JSON.parse(req.body.toString('utf8'));
+    const gatewayPayment = event.payload?.payment?.entity;
+    if (event.event === 'payment.captured' && gatewayPayment?.order_id) {
+      const payment = await Payment.findOne({ gatewayOrderId: gatewayPayment.order_id });
+      if (payment) await finalizeCapturedPayment(payment, gatewayPayment);
+    } else if (event.event === 'payment.failed' && gatewayPayment?.order_id) {
+      await Payment.updateOne(
+        { gatewayOrderId: gatewayPayment.order_id, status: 'created' },
+        { $set: { status: 'failed', failureReason: gatewayPayment.error_description || '' } },
+      );
+    }
+    return res.json({ received: true });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 const validate = (schema, req, res) => {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -145,6 +263,143 @@ app.get('/api/providers', (_req, res) =>
   res.json(carriers.map(({ name, capabilities }) => ({ name, capabilities, mode: 'demo' }))),
 );
 app.use('/api', requireVerifiedSeller);
+app.post('/api/payments/razorpay/order', async (req, res, next) => {
+  try {
+    if (!razorpayConfigured())
+      return res.status(503).json({ error: 'UPI checkout is not configured on the server yet.' });
+    const parsed = paymentOrderSchema.safeParse(req.body);
+    if (!parsed.success)
+      return res.status(400).json({ error: 'Check shipment details before paying.' });
+    const { quoteId, provider, idempotencyKey } = parsed.data;
+    const quote = quotes.get(quoteId);
+    if (!quote || quote.expiresAt < new Date().toISOString() || quote.carrier !== provider)
+      return res.status(409).json({ error: 'This courier quote expired. Choose a courier again.' });
+    if (parsed.data.shipment.paymentType === 'COD' && parsed.data.shipment.codAmount <= 0)
+      return res.status(400).json({ error: 'Enter a valid cash-on-delivery amount.' });
+
+    let payment = await Payment.findOne({ sellerId: req.sellerId, idempotencyKey });
+    if (payment && (payment.quoteId !== quoteId || payment.carrier !== provider))
+      return res
+        .status(409)
+        .json({ error: 'The selected courier changed. Restart this payment attempt.' });
+    if (payment?.status === 'used' && payment.shipmentId) {
+      const shipment = await Shipment.findById(payment.shipmentId).lean();
+      return res.json({ shipment });
+    }
+    if (payment) {
+      let gatewayPayment = payment.gatewayPaymentId
+        ? await razorpayRequest(`/payments/${encodeURIComponent(payment.gatewayPaymentId)}`)
+        : null;
+      if (!gatewayPayment) {
+        const orderPayments = await razorpayRequest(
+          `/orders/${encodeURIComponent(payment.gatewayOrderId)}/payments`,
+        );
+        gatewayPayment = orderPayments.items?.find(item => item.status === 'captured');
+      }
+      if (gatewayPayment?.status === 'captured') {
+        const shipment = await finalizeCapturedPayment(payment, gatewayPayment);
+        return res.json({ shipment });
+      }
+    }
+
+    if (!payment) {
+      const amountPaise = Math.round(quote.amount * 100);
+      const order = await razorpayRequest('/orders', 'POST', {
+        amount: amountPaise,
+        currency: 'INR',
+        receipt: idempotencyKey.slice(0, 40),
+        payment_capture: 1,
+        notes: { shipment_id: idempotencyKey, carrier: provider },
+      });
+      try {
+        payment = await Payment.create({
+          sellerId: req.sellerId,
+          gatewayOrderId: order.id,
+          idempotencyKey,
+          amountPaise,
+          currency: order.currency || 'INR',
+          carrier: provider,
+          quoteId,
+          shipmentDraft: { ...parsed.data.shipment, idempotencyKey },
+        });
+      } catch (error) {
+        if (error.code !== 11000) throw error;
+        payment = await Payment.findOne({ sellerId: req.sellerId, idempotencyKey });
+        if (!payment) throw error;
+      }
+    }
+    if (payment.status === 'failed') {
+      payment.status = 'created';
+      payment.failureReason = '';
+      await payment.save();
+    }
+    return res.json({
+      paymentId: payment.id,
+      keyId: process.env.RAZORPAY_KEY_ID,
+      orderId: payment.gatewayOrderId,
+      amount: payment.amountPaise,
+      currency: payment.currency,
+      name: 'ParcelSetus',
+      description: `Shipping with ${payment.carrier}`,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+app.post('/api/payments/razorpay/verify', async (req, res, next) => {
+  try {
+    if (!razorpayConfigured())
+      return res.status(503).json({ error: 'UPI checkout is not configured on the server yet.' });
+    const parsed = z
+      .object({
+        razorpay_order_id: z.string().min(1),
+        razorpay_payment_id: z.string().min(1),
+        razorpay_signature: z.string().regex(/^[a-f\d]{64}$/i),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Payment response is incomplete.' });
+    const payment = await Payment.findOne({
+      sellerId: req.sellerId,
+      gatewayOrderId: parsed.data.razorpay_order_id,
+    });
+    if (!payment) return res.status(404).json({ error: 'Payment order was not found.' });
+    const expected = razorpaySignature(
+      process.env.RAZORPAY_KEY_SECRET,
+      `${payment.gatewayOrderId}|${parsed.data.razorpay_payment_id}`,
+    );
+    if (!signatureMatches(parsed.data.razorpay_signature, expected))
+      return res.status(400).json({ error: 'Payment signature could not be verified.' });
+    const gatewayPayment = await razorpayRequest(
+      `/payments/${encodeURIComponent(parsed.data.razorpay_payment_id)}`,
+    );
+    if (gatewayPayment.status !== 'captured')
+      return res.status(409).json({ error: 'Payment is not captured yet. Please retry shortly.' });
+    const shipment = await finalizeCapturedPayment(payment, gatewayPayment);
+    return res.json({ shipment });
+  } catch (error) {
+    next(error);
+  }
+});
+app.get('/api/payments', async (req, res, next) => {
+  try {
+    const payments = await Payment.find({ sellerId: req.sellerId }).sort({ createdAt: -1 }).lean();
+    return res.json(
+      payments.map(payment => ({
+        id: payment._id,
+        shipmentId: payment.shipmentDraft?.idempotencyKey || '',
+        carrier: payment.carrier,
+        amount: payment.amountPaise / 100,
+        currency: payment.currency,
+        method: payment.method,
+        status: payment.status,
+        createdAt: payment.createdAt,
+        gatewayPaymentId: payment.gatewayPaymentId,
+      })),
+    );
+  } catch (error) {
+    next(error);
+  }
+});
 app.patch('/api/profile', async (req, res, next) => {
   try {
     const input = validate(profileSchema, req, res);
@@ -186,79 +441,9 @@ app.get('/api/shipments/:id', async (req, res, next) => {
     next(error);
   }
 });
-app.post('/api/shipments', async (req, res, next) => {
-  try {
-    const key = req.get('Idempotency-Key');
-    if (key) {
-      const existing = await Shipment.findOne({ sellerId: req.sellerId, idempotencyKey: key });
-      if (existing) return res.status(200).json(existing);
-    }
-    const data = bookingSchema.safeParse(req.body);
-    // Allow the web demo's concise record payload while retaining strict booking validation.
-    if (!data.success) {
-      const demo = z
-        .object({
-          id: z.string(),
-          awb: z.string(),
-          provider: z.string(),
-          recipient: z.string(),
-          destination: z.string().regex(/^\d{6}$/),
-          date: z.string(),
-          amount: z.number().nonnegative(),
-          status: z.string(),
-        })
-        .safeParse(req.body);
-      if (!demo.success)
-        return res
-          .status(400)
-          .json({ error: 'Invalid booking details', details: data.error.flatten() });
-      const record = await Shipment.create({
-        ...demo.data,
-        sellerId: req.sellerId,
-        idempotencyKey: key,
-        details: req.body,
-        events: [],
-      });
-      return res.status(201).json(record);
-    }
-    const booking = data.data;
-    const quote = quotes.get(booking.quoteId);
-    const carrier = carrierByName(booking.provider);
-    if (!carrier) return res.status(400).json({ error: 'Provider is not available' });
-    if (!quote || quote.expiresAt < new Date().toISOString() || quote.carrier !== carrier.name)
-      return res
-        .status(409)
-        .json({ error: 'Rate quote expired or invalid. Request a fresh quote.' });
-    const result = await carrier.createBooking(booking);
-    const id = `SHP-${new Date().getFullYear()}-${randomUUID().slice(0, 8).toUpperCase()}`;
-    const record = await Shipment.create({
-      id,
-      awb: result.awb,
-      provider: carrier.name,
-      recipient: booking.delivery.contactName,
-      destination: booking.delivery.pin,
-      date: new Date().toLocaleDateString('en-IN'),
-      amount: quote.amount,
-      status: result.status,
-      sellerId: req.sellerId,
-      idempotencyKey: key,
-      labelUrl: result.labelUrl,
-      demo: true,
-      events: [],
-      details: booking,
-    });
-    return res.status(201).json(record);
-  } catch (error) {
-    if (error.code === 11000) {
-      const key = req.get('Idempotency-Key');
-      if (key) {
-        const existing = await Shipment.findOne({ sellerId: req.sellerId, idempotencyKey: key });
-        if (existing) return res.status(200).json(existing);
-      }
-    }
-    return next(error);
-  }
-});
+app.post('/api/shipments', (_req, res) =>
+  res.status(403).json({ error: 'A shipment is created only after verified payment.' }),
+);
 app.post('/api/rates', async (req, res) => {
   const request = validate(quoteSchema, req, res);
   if (!request) return;
