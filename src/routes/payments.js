@@ -20,7 +20,13 @@ router.post('/payments/razorpay/order', async (req, res, next) => {
       return res.status(503).json({ error: 'UPI checkout is not configured on the server yet.' });
     const parsed = paymentOrderSchema.safeParse(req.body);
     if (!parsed.success)
-      return res.status(400).json({ error: 'Check shipment details before paying.' });
+      return res.status(400).json({
+        error: 'Check shipment details before paying.',
+        details: parsed.error.issues.map(issue => ({
+          field: issue.path.join('.'),
+          message: issue.message,
+        })),
+      });
     const { quoteId, provider, idempotencyKey } = parsed.data;
     const quote = await Quote.findOne({
       id: quoteId,

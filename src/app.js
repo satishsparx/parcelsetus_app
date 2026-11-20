@@ -35,7 +35,7 @@ app.post(
 app.use(express.json({ limit: '1mb' }));
 app.use(
   '/api/auth',
-  rateLimit({ windowMs: 15 * 60_000, limit: 12, standardHeaders: 'draft-7', legacyHeaders: false }),
+  rateLimit({ windowMs: 15 * 60_000, limit: 50, standardHeaders: 'draft-7', legacyHeaders: false }),
 );
 app.use(
   session({
