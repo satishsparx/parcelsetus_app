@@ -1,15 +1,14 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import bcrypt from 'bcryptjs';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import nodemailer from 'nodemailer';
 import { OAuth2Client } from 'google-auth-library';
-import { SessionHistory, User } from './models.js';
-import { clearSessionCookie } from './session.js';
+import { User } from './models/User.js';
+import { hashToken, startSession } from './services/sessionService.js';
 
 const router = Router();
 const google = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-const hashToken = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(32).toString('base64url');
 const emailSchema = z
   .string()
@@ -49,59 +48,6 @@ async function sendLink({ to, subject, title, link }) {
     text: `${title}\n\nOpen this link to continue: ${link}\n\nThis link expires in 30 minutes. If you did not request it, you can ignore this email.`,
   });
   return {};
-}
-
-function startSession(req, user) {
-  // Rotate the session ID on every successful authentication to prevent session fixation.
-  const previousSessionId = req.sessionID;
-  return new Promise((resolve, reject) => {
-    req.session.regenerate(error => {
-      if (error) return reject(error);
-      req.session.userId = user.id;
-      req.session.sessionVersion = user.sessionVersion || 0;
-      req.session.save(async saveError => {
-        if (saveError) return reject(saveError);
-        try {
-          const updates = [
-            SessionHistory.create({
-              userId: user.id,
-              sessionIdHash: hashToken(req.sessionID),
-              active: true,
-            }),
-          ];
-          if (previousSessionId && previousSessionId !== req.sessionID) {
-            updates.push(
-              SessionHistory.updateOne(
-                { sessionIdHash: hashToken(previousSessionId), active: true },
-                { $set: { active: false, closedAt: new Date(), closeReason: 'rotated' } },
-              ),
-            );
-          }
-          await Promise.all(updates);
-          resolve();
-        } catch (historyError) {
-          req.session.destroy(() => reject(historyError));
-        }
-      });
-    });
-  });
-}
-
-async function closeSessionHistory(req, closeReason) {
-  if (!req.sessionID || !req.session?.userId) return;
-  const now = new Date();
-  await SessionHistory.updateOne(
-    { sessionIdHash: hashToken(req.sessionID) },
-    {
-      $set: { active: false, closedAt: now, closeReason },
-      $setOnInsert: {
-        userId: req.session.userId,
-        sessionIdHash: hashToken(req.sessionID),
-        createdAt: now,
-      },
-    },
-    { upsert: true },
-  );
 }
 
 router.post('/register', async (req, res, next) => {
@@ -482,56 +428,6 @@ router.get('/me', async (req, res, next) => {
     )
       return res.status(401).json({ error: 'Sign in to continue.' });
     res.json({ user: publicUser(user) });
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.post('/logout', (req, res, next) => {
-  if (!req.session) {
-    clearSessionCookie(res);
-    return res.status(204).end();
-  }
-  const closeHistory = closeSessionHistory(req, 'logout').then(
-    () => null,
-    historyError => historyError,
-  );
-  req.session.destroy(async error => {
-    clearSessionCookie(res);
-    try {
-      const historyError = await closeHistory;
-      if (historyError) return next(historyError);
-    } catch (historyError) {
-      return next(historyError);
-    }
-    if (error) return next(error);
-    return res.status(204).end();
-  });
-});
-
-router.post('/logout-all', async (req, res, next) => {
-  try {
-    if (!req.session?.userId) return res.status(401).json({ error: 'Sign in to continue.' });
-    await User.updateOne({ _id: req.session.userId }, { $inc: { sessionVersion: 1 } });
-    await SessionHistory.updateMany(
-      { userId: req.session.userId, active: true },
-      { $set: { active: false, closedAt: new Date(), closeReason: 'logout-all' } },
-    );
-    const closeHistory = closeSessionHistory(req, 'logout-all').then(
-      () => null,
-      historyError => historyError,
-    );
-    req.session.destroy(async error => {
-      clearSessionCookie(res);
-      try {
-        const historyError = await closeHistory;
-        if (historyError) return next(historyError);
-      } catch (historyError) {
-        return next(historyError);
-      }
-      if (error) return next(error);
-      res.json({ message: 'You have been signed out from all devices.' });
-    });
   } catch (error) {
     next(error);
   }
