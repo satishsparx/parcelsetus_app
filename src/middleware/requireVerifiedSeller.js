@@ -1,4 +1,5 @@
 import { User } from '../models/User.js';
+import { clearSessionCookie } from '../session.js';
 
 export default async function requireVerifiedSeller(req, res, next) {
   try {
@@ -11,7 +12,7 @@ export default async function requireVerifiedSeller(req, res, next) {
       user.sessionVersion !== req.session.sessionVersion
     ) {
       return req.session.destroy(() => {
-        res.clearCookie('parcelsetus.sid');
+        clearSessionCookie(res);
         res.status(401).json({ error: 'Your session has expired. Sign in again.' });
       });
     }
