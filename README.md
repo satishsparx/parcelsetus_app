@@ -13,6 +13,10 @@ Node.js + Express API for ParcelSetus, including seller authentication and the e
 
 API listens on `http://localhost:4000` by default. Configure `CLIENT_ORIGIN` for the frontend origin.
 
+## Deploy to Vercel
+
+Import this backend repository as its own Vercel project and set the project root to this folder. Vercel detects the root `index.js`, which exports the Express app; `src/server.js` remains the local listener. Configure the environment variables from `.env.example` in the Vercel project settings. Use a hosted MongoDB connection string reachable from Vercel, set `CLIENT_ORIGIN` and `APP_ORIGIN` to the deployed frontend URL, and use production credentials for email, Google, and Razorpay. Do not deploy the local `.env` file. The app caches its Mongoose connection between warm function invocations, and short-lived rate quotes are stored in MongoDB so checkout works across serverless instances.
+
 ## Code quality
 
 Run `npm run lint` for backend ESLint checks, `npm run format` to apply Prettier, or `npm run format:check` to check style without editing files. Use Node 20 or newer for these commands.
@@ -52,13 +56,13 @@ Sessions use HttpOnly, SameSite cookies stored in MongoDB. All application API r
 - `GET /api/providers`
 - `GET /api/shipments` and `GET /api/shipments/:id`
 - `POST /api/rates` — validates both PIN codes and package details, checks provider capability and returns expiring demo quotes
-- `POST /api/payments/razorpay/order` and `POST /api/payments/razorpay/verify` — creates UPI-only checkout orders and verifies captured payments before creating a shipment
+- `POST /api/payments/razorpay/order` and `POST /api/payments/razorpay/verify` — creates checkout orders and verifies captured payments before creating a shipment
 - `POST /api/webhooks/razorpay` — validates gateway signatures and reconciles captured/failed payments
-- `GET /api/payments` — seller-scoped UPI transaction history
+- `GET /api/payments` — seller-scoped payment history
 - `POST /api/shipments/:id/track`
 - `GET|POST /api/addresses`, `PUT|DELETE /api/addresses/:id`
 
-Seller profiles, addresses, payments, session history, and shipments are stored in MongoDB. `src/carriers/interface.js` defines the provider contract and normalized lifecycle values. `src/carriers/demo.js` is a local preview adapter: its rates, tracking, and AWBs are not live carrier data. Use Razorpay test keys while working with these demo carrier bookings.
+Seller profiles, addresses, payments, session history, shipments, and expiring quotes are stored in MongoDB. `src/carriers/interface.js` defines the provider contract and normalized lifecycle values. `src/carriers/demo.js` is a local preview adapter: its rates, tracking, and AWBs are not live carrier data. Use Razorpay test keys while working with these demo carrier bookings.
 
 ## Remaining production work
 

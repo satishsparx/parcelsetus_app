@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { Payment } from '../models/Payment.js';
 import { Shipment } from '../models/Shipment.js';
+import { Quote } from '../models/Quote.js';
 import { paymentOrderSchema } from '../schemas.js';
 import {
   finalizeCapturedPayment,
@@ -10,7 +11,6 @@ import {
   razorpaySignature,
   signatureMatches,
 } from '../services/razorpay.js';
-import quoteStore from '../services/quotes.js';
 
 const router = Router();
 
@@ -22,8 +22,13 @@ router.post('/payments/razorpay/order', async (req, res, next) => {
     if (!parsed.success)
       return res.status(400).json({ error: 'Check shipment details before paying.' });
     const { quoteId, provider, idempotencyKey } = parsed.data;
-    const quote = quoteStore.get(quoteId);
-    if (!quote || quote.expiresAt < new Date().toISOString() || quote.carrier !== provider)
+    const quote = await Quote.findOne({
+      id: quoteId,
+      sellerId: req.sellerId,
+      carrier: provider,
+      expiresAt: { $gt: new Date() },
+    });
+    if (!quote)
       return res.status(409).json({ error: 'This courier quote expired. Choose a courier again.' });
     if (parsed.data.shipment.paymentType === 'COD' && parsed.data.shipment.codAmount <= 0)
       return res.status(400).json({ error: 'Enter a valid cash-on-delivery amount.' });

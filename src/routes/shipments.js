@@ -1,10 +1,10 @@
 import { Router } from 'express';
 import { randomUUID } from 'node:crypto';
 import { Shipment } from '../models/Shipment.js';
+import { Quote } from '../models/Quote.js';
 import { carriers } from '../carriers/demo.js';
 import { quoteSchema } from '../schemas.js';
 import { validate } from '../lib/validate.js';
-import quoteStore from '../services/quotes.js';
 
 const router = Router();
 const carrierByName = name =>
@@ -41,7 +41,15 @@ router.post('/rates', async (req, res) => {
           return { provider: carrier.name, available: false, reason: service.reason };
         const rate = await carrier.calculateRate(request);
         const quoteId = randomUUID();
-        quoteStore.set(quoteId, { ...rate, carrier: carrier.name });
+        await Quote.create({
+          id: quoteId,
+          sellerId: req.sellerId,
+          carrier: carrier.name,
+          amount: rate.amount,
+          currency: rate.currency || 'INR',
+          expiresAt: new Date(rate.expiresAt),
+          details: rate,
+        });
         return {
           provider: carrier.name,
           available: true,
