@@ -1,6 +1,7 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Payment } from '../models/Payment.js';
 import { Shipment } from '../models/Shipment.js';
+import { queueShipmentBookedNotifications } from './notificationService.js';
 
 export const razorpayConfigured = () =>
   Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
@@ -40,8 +41,15 @@ export async function finalizeCapturedPayment(payment, gatewayPayment) {
   )
     throw new Error('Payment details do not match the pending checkout.');
 
-  if (payment.status === 'used' && payment.shipmentId)
-    return Shipment.findById(payment.shipmentId).lean();
+  if (payment.status === 'used' && payment.shipmentId) {
+    const existingShipment = await Shipment.findById(payment.shipmentId).lean();
+    if (existingShipment) {
+      await queueShipmentBookedNotifications(existingShipment).catch(error =>
+        console.error('Could not queue shipment notification:', error.message),
+      );
+    }
+    return existingShipment;
+  }
 
   payment.status = 'paid';
   payment.gatewayPaymentId = gatewayPayment.id;
@@ -85,7 +93,11 @@ export async function finalizeCapturedPayment(payment, gatewayPayment) {
   payment.status = 'used';
   payment.shipmentId = shipment._id;
   await payment.save();
-  return shipment.toObject();
+  const bookedShipment = shipment.toObject();
+  await queueShipmentBookedNotifications(bookedShipment).catch(error =>
+    console.error('Could not queue shipment notification:', error.message),
+  );
+  return bookedShipment;
 }
 
 export async function handleRazorpayWebhook(req, res, next) {

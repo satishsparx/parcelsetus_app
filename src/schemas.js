@@ -58,5 +58,6 @@ export const paymentOrderSchema = z.object({
     value: z.coerce.number().nonnegative(),
     paymentType: z.enum(['Prepaid', 'COD']),
     codAmount: z.coerce.number().nonnegative().optional().default(0),
+    whatsappOptIn: z.boolean().optional().default(false),
   }),
 });

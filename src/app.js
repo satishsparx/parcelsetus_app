@@ -11,6 +11,7 @@ import paymentsRouter from './routes/payments.js';
 import sessionsRouter from './routes/sessions.js';
 import shipmentsRouter from './routes/shipments.js';
 import usersRouter from './routes/users.js';
+import notificationWorkerRouter from './routes/notificationWorker.js';
 import requireVerifiedSeller from './middleware/requireVerifiedSeller.js';
 import { handleRazorpayWebhook } from './services/razorpay.js';
 import { SESSION_COOKIE_NAME, sessionCookieOptions } from './session.js';
@@ -62,6 +63,7 @@ app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'parcels
 app.get('/api/providers', (_req, res) =>
   res.json(carriers.map(({ name, capabilities }) => ({ name, capabilities, mode: 'demo' }))),
 );
+app.use('/api/internal/notifications', notificationWorkerRouter);
 app.use('/api', requireVerifiedSeller);
 app.use('/api', usersRouter);
 app.use('/api', addressesRouter);

@@ -4,3 +4,4 @@ export { Shipment } from './models/Shipment.js';
 export { Payment } from './models/Payment.js';
 export { SessionHistory } from './models/SessionHistory.js';
 export { Quote } from './models/Quote.js';
+export { NotificationJob } from './models/NotificationJob.js';
