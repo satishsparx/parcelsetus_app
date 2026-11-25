@@ -5,7 +5,7 @@ Node.js + Express API for ParcelSetus, including seller authentication and the e
 ## Run locally
 
 1. Use Node.js 20 or newer and install/start MongoDB locally, or create a MongoDB database.
-2. Copy `.env.example` to `.env` and set `MONGODB_URI` and a long random `SESSION_SECRET`.
+2. Copy `.env.example` to `.env` and set `MONGODB_URI` and a unique, long random `AUTH_TOKEN_SECRET` (at least 32 random bytes). Existing deployments may temporarily use `SESSION_SECRET` as the JWT signing secret during migration.
 3. Configure SMTP (`SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_FROM`) to send verification and reset links. In local development without SMTP, the API returns a one-time development link in the response.
 4. Optional Google sign-in: configure a Google OAuth web client, set its client ID as `GOOGLE_CLIENT_ID` here and `VITE_GOOGLE_CLIENT_ID` in the frontend.
 5. UPI checkout: set Razorpay test credentials in `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET`. Configure a Razorpay webhook to `POST /api/webhooks/razorpay`, subscribe to `payment.captured` and `payment.failed`, and set its signing secret in `RAZORPAY_WEBHOOK_SECRET`.
@@ -66,4 +66,4 @@ Seller profiles, addresses, payments, session history, shipments, and expiring q
 
 ## Remaining production work
 
-Quote data and carrier adapters remain demo implementations. Connect credential-backed carrier services and reconcile shipment creation with carrier booking, then add monitoring and backups. Do not expose carrier or payment secrets to the frontend. In production, use HTTPS, set a unique `SESSION_SECRET`, configure trusted proxy settings if applicable, and use an SMTP provider with verified sender identity.
+Quote data and carrier adapters remain demo implementations. Connect credential-backed carrier services and reconcile shipment creation with carrier booking, then add monitoring and backups. Do not expose carrier or payment secrets to the frontend. In production, use HTTPS, set a unique `AUTH_TOKEN_SECRET`, configure trusted proxy settings if applicable, and use an SMTP provider with verified sender identity. Authentication uses a signed JWT stored only in an HttpOnly cookie. Session IDs are hashed in MongoDB and checked on protected requests so logout, logout-all, and session history remain revocable.

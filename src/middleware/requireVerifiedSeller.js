@@ -1,24 +1,42 @@
 import { User } from '../models/User.js';
-import { clearSessionCookie } from '../session.js';
+import { SessionHistory } from '../models/SessionHistory.js';
+import { clearAuthCookie } from '../authToken.js';
+import { hashToken } from '../services/sessionService.js';
 
-export default async function requireVerifiedSeller(req, res, next) {
+export async function requireAuthenticatedUser(req, res, next) {
   try {
-    if (!req.session?.userId) return res.status(401).json({ error: 'Sign in to continue.' });
-    const user = await User.findById(req.session.userId).select('+sessionVersion');
+    const claims = req.authClaims;
+    if (!claims?.sub || !claims?.jti || !Number.isInteger(claims.ver)) {
+      clearAuthCookie(res);
+      return res.status(401).json({ error: 'Sign in to continue.' });
+    }
+
+    const [user, activeSession] = await Promise.all([
+      User.findById(claims.sub).select('+sessionVersion'),
+      SessionHistory.exists({
+        userId: claims.sub,
+        sessionIdHash: hashToken(claims.jti),
+        active: true,
+      }),
+    ]);
+
     if (
       !user ||
+      !activeSession ||
       user.status !== 'active' ||
       !user.emailVerifiedAt ||
-      user.sessionVersion !== req.session.sessionVersion
+      user.sessionVersion !== claims.ver
     ) {
-      return req.session.destroy(() => {
-        clearSessionCookie(res);
-        res.status(401).json({ error: 'Your session has expired. Sign in again.' });
-      });
+      clearAuthCookie(res);
+      return res.status(401).json({ error: 'Your session has expired. Sign in again.' });
     }
+
+    req.auth = { user, userId: user.id, jti: claims.jti, sessionVersion: claims.ver };
     req.sellerId = user.id;
-    next();
+    return next();
   } catch (error) {
-    next(error);
+    return next(error);
   }
 }
+
+export default requireAuthenticatedUser;

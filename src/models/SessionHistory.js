@@ -7,7 +7,11 @@ const sessionHistorySchema = new mongoose.Schema(
     active: { type: Boolean, default: true, index: true },
     createdAt: { type: Date, default: Date.now },
     closedAt: { type: Date, default: null },
-    closeReason: { type: String, enum: ['logout', 'logout-all', 'rotated'], default: null },
+    closeReason: {
+      type: String,
+      enum: ['logout', 'logout-all', 'rotated', 'password-reset'],
+      default: null,
+    },
   },
   { versionKey: false, collection: 'session_history' },
 );

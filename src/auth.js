@@ -5,7 +5,9 @@ import { randomBytes } from 'node:crypto';
 import nodemailer from 'nodemailer';
 import { OAuth2Client } from 'google-auth-library';
 import { User } from './models/User.js';
+import { SessionHistory } from './models/SessionHistory.js';
 import { hashToken, startSession } from './services/sessionService.js';
+import { requireAuthenticatedUser } from './middleware/requireVerifiedSeller.js';
 
 const router = Router();
 const google = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -123,7 +125,7 @@ router.post('/verify-email', async (req, res, next) => {
     user.verificationTokenHash = undefined;
     user.verificationExpiresAt = undefined;
     await user.save();
-    await startSession(req, user);
+    await startSession(req, res, user);
     return res.json({ message: 'Email verified. Your account is ready.', user: publicUser(user) });
   } catch (error) {
     next(error);
@@ -167,19 +169,11 @@ router.post('/resend-verification', async (req, res, next) => {
   }
 });
 
-router.post('/change-email', async (req, res, next) => {
+router.post('/change-email', requireAuthenticatedUser, async (req, res, next) => {
   try {
-    if (!req.session?.userId) return res.status(401).json({ error: 'Sign in to continue.' });
     const parsed = emailSchema.safeParse(req.body?.email);
     if (!parsed.success) return res.status(400).json({ error: 'Enter a valid email address.' });
-    const user = await User.findById(req.session.userId).select('+sessionVersion');
-    if (
-      !user ||
-      user.status !== 'active' ||
-      !user.emailVerifiedAt ||
-      user.sessionVersion !== req.session.sessionVersion
-    )
-      return res.status(401).json({ error: 'Sign in again to continue.' });
+    const user = req.auth.user;
     if (parsed.data === user.email)
       return res.json({ message: 'This is already your account email address.' });
     if (await User.exists({ email: parsed.data }))
@@ -253,7 +247,7 @@ router.post('/login', async (req, res, next) => {
       return res
         .status(403)
         .json({ code: 'EMAIL_NOT_VERIFIED', error: 'Verify your email before signing in.' });
-    await startSession(req, user);
+    await startSession(req, res, user);
     res.json({ user: publicUser(user) });
   } catch (error) {
     next(error);
@@ -312,7 +306,7 @@ router.post('/google', async (req, res, next) => {
       });
       user.sessionVersion = 0;
     }
-    await startSession(req, user);
+    await startSession(req, res, user);
     res.json({ user: publicUser(user) });
   } catch (error) {
     if (error.name === 'Error' || error.name === 'GaxiosError')
@@ -382,26 +376,22 @@ router.post('/reset-password', async (req, res, next) => {
     user.resetExpiresAt = undefined;
     user.sessionVersion += 1;
     await user.save();
+    await SessionHistory.updateMany(
+      { userId: user.id, active: true },
+      { $set: { active: false, closedAt: new Date(), closeReason: 'password-reset' } },
+    );
     res.json({ message: 'Password updated. You can now sign in.' });
   } catch (error) {
     next(error);
   }
 });
 
-router.post('/link-password', async (req, res, next) => {
+router.post('/link-password', requireAuthenticatedUser, async (req, res, next) => {
   try {
-    if (!req.session?.userId) return res.status(401).json({ error: 'Sign in to continue.' });
     const parsed = z.object({ password: passwordSchema }).safeParse(req.body);
     if (!parsed.success)
       return res.status(400).json({ error: 'Use a password with at least 10 characters.' });
-    const user = await User.findById(req.session.userId).select('+passwordHash +sessionVersion');
-    if (
-      !user ||
-      user.status !== 'active' ||
-      !user.emailVerifiedAt ||
-      user.sessionVersion !== req.session.sessionVersion
-    )
-      return res.status(401).json({ error: 'Sign in again to continue.' });
+    const user = await User.findById(req.auth.userId).select('+passwordHash +sessionVersion');
     if (user.passwordHash)
       return res.status(409).json({ error: 'A password is already connected to this account.' });
     user.passwordHash = await bcrypt.hash(parsed.data.password, 12);
@@ -416,18 +406,9 @@ router.post('/link-password', async (req, res, next) => {
   }
 });
 
-router.get('/me', async (req, res, next) => {
+router.get('/me', requireAuthenticatedUser, async (req, res, next) => {
   try {
-    if (!req.session?.userId) return res.status(401).json({ error: 'Sign in to continue.' });
-    const user = await User.findById(req.session.userId).select('+sessionVersion');
-    if (
-      !user ||
-      user.status !== 'active' ||
-      !user.emailVerifiedAt ||
-      user.sessionVersion !== req.session.sessionVersion
-    )
-      return res.status(401).json({ error: 'Sign in to continue.' });
-    res.json({ user: publicUser(user) });
+    res.json({ user: publicUser(req.auth.user) });
   } catch (error) {
     next(error);
   }
